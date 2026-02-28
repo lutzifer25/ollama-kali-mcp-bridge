@@ -2,6 +2,10 @@
   "default_timeout_sec": 30,
   "max_timeout_sec": 180,
   "max_output_bytes": 131072,
+  "ssh_connect_timeout_sec": 10,
+  "ssh_server_alive_interval_sec": 15,
+  "ssh_server_alive_count_max": 2,
+  "ssh_strict_host_key_checking": true,
   "tools": {
     "nmap": {
       "command": "/usr/bin/nmap",

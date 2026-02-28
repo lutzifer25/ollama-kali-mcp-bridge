@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -20,6 +20,8 @@ struct Cli {
 enum Commands {
     Run(RunArgs),
     Serve(ServeArgs),
+    McpServe(ServeArgs),
+    WorkflowServe(ServeArgs),
     PrintSchema,
 }
 
@@ -68,6 +70,14 @@ struct BridgeConfig {
     max_timeout_sec: u64,
     #[serde(default = "default_max_output")]
     max_output_bytes: usize,
+    #[serde(default = "default_ssh_connect_timeout")]
+    ssh_connect_timeout_sec: u64,
+    #[serde(default = "default_ssh_server_alive_interval")]
+    ssh_server_alive_interval_sec: u64,
+    #[serde(default = "default_ssh_server_alive_count_max")]
+    ssh_server_alive_count_max: u64,
+    #[serde(default = "default_strict_host_key_checking")]
+    ssh_strict_host_key_checking: bool,
     #[serde(default)]
     tools: HashMap<String, ToolPolicy>,
 }
@@ -82,6 +92,22 @@ fn default_max_timeout() -> u64 {
 
 fn default_max_output() -> usize {
     128 * 1024
+}
+
+fn default_ssh_connect_timeout() -> u64 {
+    10
+}
+
+fn default_ssh_server_alive_interval() -> u64 {
+    15
+}
+
+fn default_ssh_server_alive_count_max() -> u64 {
+    2
+}
+
+fn default_strict_host_key_checking() -> bool {
+    true
 }
 
 impl Default for BridgeConfig {
@@ -115,6 +141,10 @@ impl Default for BridgeConfig {
             default_timeout_sec: default_timeout(),
             max_timeout_sec: default_max_timeout(),
             max_output_bytes: default_max_output(),
+            ssh_connect_timeout_sec: default_ssh_connect_timeout(),
+            ssh_server_alive_interval_sec: default_ssh_server_alive_interval(),
+            ssh_server_alive_count_max: default_ssh_server_alive_count_max(),
+            ssh_strict_host_key_checking: default_strict_host_key_checking(),
             tools,
         }
     }
@@ -126,6 +156,53 @@ struct RunRequest {
     host: String,
     user: Option<String>,
     tool: String,
+    #[serde(default)]
+    args: Vec<String>,
+    timeout_sec: Option<u64>,
+    max_output_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WorkflowRequest {
+    id: Option<String>,
+    host: String,
+    user: Option<String>,
+    #[serde(default = "default_stop_on_error")]
+    stop_on_error: bool,
+    steps: Vec<WorkflowStep>,
+}
+
+fn default_stop_on_error() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WorkflowStep {
+    tool: String,
+    #[serde(default)]
+    args: Vec<String>,
+    timeout_sec: Option<u64>,
+    max_output_bytes: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonRpcRequest {
+    id: Option<Value>,
+    method: String,
+    params: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct McpCallParams {
+    name: String,
+    #[serde(default)]
+    arguments: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct McpToolArguments {
+    host: String,
+    user: Option<String>,
     #[serde(default)]
     args: Vec<String>,
     timeout_sec: Option<u64>,
@@ -144,6 +221,14 @@ struct FinalStatus {
     exit_code: Option<i32>,
     timed_out: bool,
     duration_ms: u128,
+}
+
+#[derive(Debug)]
+struct CollectedRun {
+    final_status: FinalStatus,
+    stdout: String,
+    stderr: String,
+    truncated: bool,
 }
 
 #[derive(Debug)]
@@ -173,6 +258,14 @@ async fn main() -> Result<()> {
         Commands::Serve(args) => {
             let config = load_config(&args.config).await?;
             serve_stdio(&config).await?;
+        }
+        Commands::McpServe(args) => {
+            let config = load_config(&args.config).await?;
+            serve_mcp_stdio(&config).await?;
+        }
+        Commands::WorkflowServe(args) => {
+            let config = load_config(&args.config).await?;
+            serve_workflow_stdio(&config).await?;
         }
         Commands::PrintSchema => print_schema()?,
     }
@@ -235,6 +328,354 @@ async fn serve_stdio(config: &BridgeConfig) -> Result<()> {
     Ok(())
 }
 
+async fn serve_mcp_stdio(config: &BridgeConfig) -> Result<()> {
+    let stdin = io::stdin();
+    let mut lines = BufReader::new(stdin).lines();
+    let mut out = io::stdout();
+
+    while let Some(line) = lines.next_line().await? {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let parsed = serde_json::from_str::<JsonRpcRequest>(&line);
+        let request = match parsed {
+            Ok(req) => req,
+            Err(error) => {
+                write_json_line(
+                    &mut out,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": Value::Null,
+                        "error": {
+                            "code": -32700,
+                            "message": format!("parse error: {}", error)
+                        }
+                    }),
+                )
+                .await?;
+                continue;
+            }
+        };
+
+        handle_mcp_request(config, request, &mut out).await?;
+    }
+
+    Ok(())
+}
+
+async fn handle_mcp_request<W: AsyncWrite + Unpin>(
+    config: &BridgeConfig,
+    request: JsonRpcRequest,
+    writer: &mut W,
+) -> Result<()> {
+    let id = request.id.unwrap_or(Value::Null);
+    match request.method.as_str() {
+        "initialize" => {
+            write_json_line(
+                writer,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocolVersion": "2025-01-01",
+                        "capabilities": {
+                            "tools": {}
+                        },
+                        "serverInfo": {
+                            "name": "ollama-kali-mcp-bridge",
+                            "version": env!("CARGO_PKG_VERSION")
+                        }
+                    }
+                }),
+            )
+            .await?;
+        }
+        "tools/list" => {
+            let tools = config
+                .tools
+                .iter()
+                .map(|(name, policy)| {
+                    json!({
+                        "name": name,
+                        "description": format!("Executes {} on Kali via SSH with timeout enforcement", policy.command),
+                        "inputSchema": {
+                            "type": "object",
+                            "required": ["host"],
+                            "properties": {
+                                "host": {"type": "string"},
+                                "user": {"type": "string"},
+                                "args": {"type": "array", "items": {"type": "string"}},
+                                "timeout_sec": {"type": "integer", "minimum": 1},
+                                "max_output_bytes": {"type": "integer", "minimum": 1024}
+                            }
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            write_json_line(
+                writer,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {"tools": tools}
+                }),
+            )
+            .await?;
+        }
+        "tools/call" => {
+            let params_value = request.params.unwrap_or_else(|| json!({}));
+            let params: McpCallParams = match serde_json::from_value(params_value) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    write_json_line(
+                        writer,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {
+                                "code": -32602,
+                                "message": format!("invalid params: {}", error)
+                            }
+                        }),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+
+            let arguments: McpToolArguments = match serde_json::from_value(params.arguments) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    write_json_line(
+                        writer,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {
+                                "code": -32602,
+                                "message": format!("invalid tool arguments: {}", error)
+                            }
+                        }),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+
+            let run = RunRequest {
+                id: Some("mcp-call".to_string()),
+                host: arguments.host,
+                user: arguments.user,
+                tool: params.name,
+                args: arguments.args,
+                timeout_sec: arguments.timeout_sec,
+                max_output_bytes: arguments.max_output_bytes,
+            };
+
+            let result = execute_request_collect(config, run).await;
+            match result {
+                Ok(collected) => {
+                    let summary = format!(
+                        "exit_code={:?}, timed_out={}, duration_ms={}",
+                        collected.final_status.exit_code,
+                        collected.final_status.timed_out,
+                        collected.final_status.duration_ms
+                    );
+                    write_json_line(
+                        writer,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [
+                                    {"type": "text", "text": summary},
+                                    {"type": "text", "text": collected.stdout},
+                                    {"type": "text", "text": collected.stderr}
+                                ],
+                                "isError": collected.final_status.exit_code.unwrap_or(1) != 0 || collected.final_status.timed_out,
+                                "structuredContent": {
+                                    "exit_code": collected.final_status.exit_code,
+                                    "timed_out": collected.final_status.timed_out,
+                                    "duration_ms": collected.final_status.duration_ms,
+                                    "truncated": collected.truncated
+                                }
+                            }
+                        }),
+                    )
+                    .await?;
+                }
+                Err(error) => {
+                    write_json_line(
+                        writer,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {
+                                "code": -32000,
+                                "message": error.to_string()
+                            }
+                        }),
+                    )
+                    .await?;
+                }
+            }
+        }
+        _ => {
+            write_json_line(
+                writer,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32601,
+                        "message": format!("method not found: {}", request.method)
+                    }
+                }),
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn serve_workflow_stdio(config: &BridgeConfig) -> Result<()> {
+    let stdin = io::stdin();
+    let mut lines = BufReader::new(stdin).lines();
+    let mut out = io::stdout();
+
+    while let Some(line) = lines.next_line().await? {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let workflow: WorkflowRequest = match serde_json::from_str(&line) {
+            Ok(req) => req,
+            Err(error) => {
+                emit(
+                    &mut out,
+                    Event {
+                        id: "workflow".to_string(),
+                        event: "error".to_string(),
+                        payload: json!({"code": "E_PARSE", "message": error.to_string()}),
+                    },
+                )
+                .await?;
+                continue;
+            }
+        };
+
+        run_workflow(config, workflow, &mut out).await?;
+    }
+
+    Ok(())
+}
+
+async fn run_workflow<W: AsyncWrite + Unpin>(
+    config: &BridgeConfig,
+    workflow: WorkflowRequest,
+    writer: &mut W,
+) -> Result<()> {
+    let id = workflow.id.unwrap_or_else(|| "workflow".to_string());
+    let stop_on_error = workflow.stop_on_error;
+    let mut last_status = json!({"state": "empty"});
+
+    emit(
+        writer,
+        Event {
+            id: id.clone(),
+            event: "workflow_started".to_string(),
+            payload: json!({"steps": workflow.steps.len()}),
+        },
+    )
+    .await?;
+
+    for (index, step) in workflow.steps.iter().enumerate() {
+        emit(
+            writer,
+            Event {
+                id: id.clone(),
+                event: "step_started".to_string(),
+                payload: json!({"index": index, "tool": step.tool}),
+            },
+        )
+        .await?;
+
+        let run = RunRequest {
+            id: Some(format!("{}-step-{}", id, index)),
+            host: workflow.host.clone(),
+            user: workflow.user.clone(),
+            tool: step.tool.clone(),
+            args: step.args.clone(),
+            timeout_sec: step.timeout_sec,
+            max_output_bytes: step.max_output_bytes,
+        };
+
+        let collected = execute_request_collect(config, run).await;
+        match collected {
+            Ok(result) => {
+                let failed = result.final_status.timed_out || result.final_status.exit_code.unwrap_or(1) != 0;
+                last_status = json!({
+                    "index": index,
+                    "exit_code": result.final_status.exit_code,
+                    "timed_out": result.final_status.timed_out,
+                    "duration_ms": result.final_status.duration_ms,
+                    "truncated": result.truncated,
+                    "stdout_preview": result.stdout.chars().take(240).collect::<String>(),
+                    "stderr_preview": result.stderr.chars().take(240).collect::<String>()
+                });
+
+                emit(
+                    writer,
+                    Event {
+                        id: id.clone(),
+                        event: "step_finished".to_string(),
+                        payload: last_status.clone(),
+                    },
+                )
+                .await?;
+
+                if failed && stop_on_error {
+                    break;
+                }
+            }
+            Err(error) => {
+                last_status = json!({
+                    "index": index,
+                    "error": error.to_string()
+                });
+                emit(
+                    writer,
+                    Event {
+                        id: id.clone(),
+                        event: "step_failed".to_string(),
+                        payload: last_status.clone(),
+                    },
+                )
+                .await?;
+
+                if stop_on_error {
+                    break;
+                }
+            }
+        }
+    }
+
+    emit(
+        writer,
+        Event {
+            id,
+            event: "workflow_finished".to_string(),
+            payload: last_status,
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
 async fn run_request<W: AsyncWrite + Unpin>(
     config: &BridgeConfig,
     request: RunRequest,
@@ -278,11 +719,7 @@ async fn run_request<W: AsyncWrite + Unpin>(
     .await?;
 
     let remote_command = build_remote_command(policy, &request.args, timeout_sec);
-    let mut child = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg(target)
-        .arg(remote_command)
+    let mut child = build_ssh_command(config, &target, &remote_command)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -414,6 +851,142 @@ async fn run_request<W: AsyncWrite + Unpin>(
     Ok(final_status)
 }
 
+async fn execute_request_collect(config: &BridgeConfig, request: RunRequest) -> Result<CollectedRun> {
+    let policy = config
+        .tools
+        .get(&request.tool)
+        .ok_or_else(|| anyhow!("tool '{}' ist nicht freigegeben", request.tool))?;
+
+    if request.args.len() > policy.max_args {
+        bail!(
+            "zu viele args für tool '{}': {} > {}",
+            request.tool,
+            request.args.len(),
+            policy.max_args
+        );
+    }
+
+    let timeout_sec = request
+        .timeout_sec
+        .unwrap_or(config.default_timeout_sec)
+        .min(config.max_timeout_sec);
+    let max_output_bytes = request.max_output_bytes.unwrap_or(config.max_output_bytes);
+    let target = format_target(&request.user, &request.host);
+    let remote_command = build_remote_command(policy, &request.args, timeout_sec);
+
+    let mut child = build_ssh_command(config, &target, &remote_command)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("SSH-Prozess konnte nicht gestartet werden")?;
+
+    let stdout = child.stdout.take().context("stdout pipe fehlt")?;
+    let stderr = child.stderr.take().context("stderr pipe fehlt")?;
+    let (tx, mut rx) = mpsc::channel::<Chunk>(64);
+
+    let tx_out = tx.clone();
+    let out_task = tokio::spawn(async move {
+        let mut reader = BufReader::new(stdout);
+        let mut buf = [0_u8; 4096];
+        loop {
+            let read = reader.read(&mut buf).await?;
+            if read == 0 {
+                break;
+            }
+            if tx_out.send(Chunk::Stdout(buf[..read].to_vec())).await.is_err() {
+                break;
+            }
+        }
+        Result::<()>::Ok(())
+    });
+
+    let err_task = tokio::spawn(async move {
+        let mut reader = BufReader::new(stderr);
+        let mut buf = [0_u8; 4096];
+        loop {
+            let read = reader.read(&mut buf).await?;
+            if read == 0 {
+                break;
+            }
+            if tx.send(Chunk::Stderr(buf[..read].to_vec())).await.is_err() {
+                break;
+            }
+        }
+        Result::<()>::Ok(())
+    });
+
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(timeout_sec);
+    let mut process_done = false;
+    let mut timed_out = false;
+    let mut exit_code = None;
+    let mut written_bytes = 0_usize;
+    let mut truncated = false;
+    let mut stdout_text = String::new();
+    let mut stderr_text = String::new();
+
+    while !process_done || !rx.is_closed() {
+        tokio::select! {
+            chunk = rx.recv() => {
+                if let Some(chunk) = chunk {
+                    if written_bytes >= max_output_bytes {
+                        truncated = true;
+                        continue;
+                    }
+
+                    let (data, is_stdout) = match chunk {
+                        Chunk::Stdout(bytes) => (bytes, true),
+                        Chunk::Stderr(bytes) => (bytes, false),
+                    };
+                    let remaining = max_output_bytes - written_bytes;
+                    let part = if data.len() > remaining { &data[..remaining] } else { &data[..] };
+                    written_bytes += part.len();
+                    if part.len() < data.len() {
+                        truncated = true;
+                    }
+                    let text = String::from_utf8_lossy(part).to_string();
+                    if is_stdout {
+                        stdout_text.push_str(&text);
+                    } else {
+                        stderr_text.push_str(&text);
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(100)), if !process_done => {
+                if let Some(status) = child.try_wait().context("Statusprüfung des SSH-Prozesses fehlgeschlagen")? {
+                    exit_code = status.code();
+                    process_done = true;
+                } else if Instant::now() >= deadline {
+                    timed_out = true;
+                    let _ = child.kill().await;
+                    let status = child.wait().await.context("Timeout und kill fehlgeschlagen")?;
+                    exit_code = status.code();
+                    process_done = true;
+                }
+            }
+            else => {
+                if process_done {
+                    break;
+                }
+            }
+        }
+    }
+
+    out_task.await.context("stdout task join fehlgeschlagen")??;
+    err_task.await.context("stderr task join fehlgeschlagen")??;
+
+    Ok(CollectedRun {
+        final_status: FinalStatus {
+            exit_code,
+            timed_out,
+            duration_ms: started.elapsed().as_millis(),
+        },
+        stdout: stdout_text,
+        stderr: stderr_text,
+        truncated,
+    })
+}
+
 fn build_remote_command(policy: &ToolPolicy, args: &[String], timeout_sec: u64) -> String {
     let mut full_args = Vec::new();
     full_args.push(policy.command.clone());
@@ -428,6 +1001,37 @@ fn build_remote_command(policy: &ToolPolicy, args: &[String], timeout_sec: u64) 
         "timeout --signal=TERM --kill-after=5s {}s {}",
         timeout_sec, escaped
     )
+}
+
+fn build_ssh_command(config: &BridgeConfig, target: &str, remote_command: &str) -> Command {
+    let mut command = Command::new("ssh");
+    command
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg(format!("ConnectTimeout={}", config.ssh_connect_timeout_sec))
+        .arg("-o")
+        .arg(format!(
+            "ServerAliveInterval={}",
+            config.ssh_server_alive_interval_sec
+        ))
+        .arg("-o")
+        .arg(format!(
+            "ServerAliveCountMax={}",
+            config.ssh_server_alive_count_max
+        ))
+        .arg("-o")
+        .arg(format!(
+            "StrictHostKeyChecking={}",
+            if config.ssh_strict_host_key_checking {
+                "yes"
+            } else {
+                "no"
+            }
+        ))
+        .arg(target)
+        .arg(remote_command);
+    command
 }
 
 fn shell_escape(input: &str) -> String {
@@ -447,6 +1051,14 @@ fn format_target(user: &Option<String>, host: &str) -> String {
 
 async fn emit<W: AsyncWrite + Unpin>(writer: &mut W, event: Event) -> Result<()> {
     let line = serde_json::to_string(&event)?;
+    writer.write_all(line.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+async fn write_json_line<W: AsyncWrite + Unpin>(writer: &mut W, value: Value) -> Result<()> {
+    let line = serde_json::to_string(&value)?;
     writer.write_all(line.as_bytes()).await?;
     writer.write_all(b"\n").await?;
     writer.flush().await?;

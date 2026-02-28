@@ -9,13 +9,16 @@ Systemnahe Bridge zwischen Ollama (Agent/LLM) auf macOS und Kali-Tools auf Kali 
 - Streaming-Feedback an die KI liefern
 - KI kann anhand von `finished`/`error` den nächsten Schritt einleiten
 
-## Features (MVP)
+## Features
 
 - JSON-Line Protokoll über STDIO (`serve`)
+- MCP JSON-RPC Endpoint über STDIO (`mcp-serve`) mit `tools/list` und `tools/call`
+- Workflow-State-Machine über STDIO (`workflow-serve`) für Mehrschritt-Ausführung
 - Einzelaufruf per CLI (`run`)
 - SSH-Transport macOS -> Kali
 - Tool-Whitelist mit Arg-Limit
 - `timeout --signal=TERM --kill-after=5s` auf Kali
+- SSH-Härtung: `ConnectTimeout`, `ServerAliveInterval`, `ServerAliveCountMax`, `StrictHostKeyChecking`
 - Strukturierte Events: `started`, `stdout_chunk`, `stderr_chunk`, `output_truncated`, `finished`, `error`
 
 ## Voraussetzungen
@@ -70,6 +73,38 @@ Dann pro Zeile ein JSON-Request an `stdin` senden:
 
 Antwort sind JSON-Events zeilenweise auf `stdout`.
 
+### 4) MCP-Serve (`tools/list`, `tools/call`)
+
+```bash
+cargo run -- mcp-serve --config bridge-config.json
+```
+
+Beispiel `tools/list` Request:
+
+```json
+{"id":1,"method":"tools/list"}
+```
+
+Beispiel `tools/call` Request:
+
+```json
+{"id":2,"method":"tools/call","params":{"name":"nmap","arguments":{"host":"192.168.178.70","user":"kali","args":["-sn","192.168.178.0/24"],"timeout_sec":40}}}
+```
+
+### 5) Workflow-State-Machine (Mehrschritt)
+
+```bash
+cargo run -- workflow-serve --config bridge-config.json
+```
+
+Workflow-Request (eine Zeile JSON):
+
+```json
+{"id":"wf-1","host":"192.168.178.70","user":"kali","stop_on_error":true,"steps":[{"tool":"nmap","args":["-sn","192.168.178.0/24"],"timeout_sec":40},{"tool":"nikto","args":["-h","http://192.168.178.10"],"timeout_sec":60}]}
+```
+
+Antwort-Events: `workflow_started`, `step_started`, `step_finished`, `step_failed`, `workflow_finished`.
+
 ## Sicherheitsprinzipien
 
 - Keine freien Shell-Kommandos aus der KI
@@ -79,6 +114,5 @@ Antwort sind JSON-Events zeilenweise auf `stdout`.
 
 ## Nächste Schritte
 
-- MCP-Adapter (`tools/list`, `tools/call`) auf dieses JSON-Line-Protokoll legen
 - Retry-Policy + Backoff + Korrelations-IDs erweitern
 - Integrationstests gegen echte Kali-VM
