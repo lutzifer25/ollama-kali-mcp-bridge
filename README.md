@@ -123,6 +123,18 @@ Beispiel-Logzeile:
 {"ts_ms":1740770600123,"event":"retry_scheduled","payload":{"correlation_id":"mcp-call","attempt":1,"next_attempt":2,"backoff_ms":750}}
 ```
 
+## Integrationstests (echte Kali-Tools)
+
+Für End-to-End Tests gegen eine echte Kali-VM:
+
+```bash
+cp tests/integration/integration.env.example tests/integration/integration.env
+# Werte in integration.env anpassen
+bash tests/integration/run_real_kali_tests.sh
+```
+
+Details und Prüfumfang siehe `tests/integration/README.md`.
+
 ## Sicherheitsprinzipien
 
 - Keine freien Shell-Kommandos aus der KI
@@ -133,4 +145,4 @@ Beispiel-Logzeile:
 ## Nächste Schritte
 
 - Retry-Policy + Backoff + Korrelations-IDs erweitern
-- Integrationstests gegen echte Kali-VM
+- CI-Anbindung für Integrationstests vorbereiten
