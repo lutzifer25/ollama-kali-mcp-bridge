@@ -6,6 +6,9 @@
   "ssh_server_alive_interval_sec": 15,
   "ssh_server_alive_count_max": 2,
   "ssh_strict_host_key_checking": true,
+  "max_retries": 1,
+  "retry_backoff_ms": 750,
+  "observability_json_logs": true,
   "tools": {
     "nmap": {
       "command": "/usr/bin/nmap",

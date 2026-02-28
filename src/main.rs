@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::SystemTime;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -78,6 +79,12 @@ struct BridgeConfig {
     ssh_server_alive_count_max: u64,
     #[serde(default = "default_strict_host_key_checking")]
     ssh_strict_host_key_checking: bool,
+    #[serde(default = "default_max_retries")]
+    max_retries: u32,
+    #[serde(default = "default_retry_backoff_ms")]
+    retry_backoff_ms: u64,
+    #[serde(default = "default_observability_json_logs")]
+    observability_json_logs: bool,
     #[serde(default)]
     tools: HashMap<String, ToolPolicy>,
 }
@@ -107,6 +114,18 @@ fn default_ssh_server_alive_count_max() -> u64 {
 }
 
 fn default_strict_host_key_checking() -> bool {
+    true
+}
+
+fn default_max_retries() -> u32 {
+    1
+}
+
+fn default_retry_backoff_ms() -> u64 {
+    750
+}
+
+fn default_observability_json_logs() -> bool {
     true
 }
 
@@ -145,6 +164,9 @@ impl Default for BridgeConfig {
             ssh_server_alive_interval_sec: default_ssh_server_alive_interval(),
             ssh_server_alive_count_max: default_ssh_server_alive_count_max(),
             ssh_strict_host_key_checking: default_strict_host_key_checking(),
+            max_retries: default_max_retries(),
+            retry_backoff_ms: default_retry_backoff_ms(),
+            observability_json_logs: default_observability_json_logs(),
             tools,
         }
     }
@@ -229,6 +251,7 @@ struct CollectedRun {
     stdout: String,
     stderr: String,
     truncated: bool,
+    attempts: u32,
 }
 
 #[derive(Debug)]
@@ -478,10 +501,11 @@ async fn handle_mcp_request<W: AsyncWrite + Unpin>(
             match result {
                 Ok(collected) => {
                     let summary = format!(
-                        "exit_code={:?}, timed_out={}, duration_ms={}",
+                        "exit_code={:?}, timed_out={}, duration_ms={}, attempts={}",
                         collected.final_status.exit_code,
                         collected.final_status.timed_out,
-                        collected.final_status.duration_ms
+                        collected.final_status.duration_ms,
+                        collected.attempts
                     );
                     write_json_line(
                         writer,
@@ -499,7 +523,8 @@ async fn handle_mcp_request<W: AsyncWrite + Unpin>(
                                     "exit_code": collected.final_status.exit_code,
                                     "timed_out": collected.final_status.timed_out,
                                     "duration_ms": collected.final_status.duration_ms,
-                                    "truncated": collected.truncated
+                                    "truncated": collected.truncated,
+                                    "attempts": collected.attempts
                                 }
                             }
                         }),
@@ -623,6 +648,7 @@ async fn run_workflow<W: AsyncWrite + Unpin>(
                     "timed_out": result.final_status.timed_out,
                     "duration_ms": result.final_status.duration_ms,
                     "truncated": result.truncated,
+                    "attempts": result.attempts,
                     "stdout_preview": result.stdout.chars().take(240).collect::<String>(),
                     "stderr_preview": result.stderr.chars().take(240).collect::<String>()
                 });
@@ -702,6 +728,18 @@ async fn run_request<W: AsyncWrite + Unpin>(
         .min(config.max_timeout_sec);
     let max_output_bytes = request.max_output_bytes.unwrap_or(config.max_output_bytes);
     let target = format_target(&request.user, &request.host);
+
+    log_observation(
+        config,
+        "stream_run_started",
+        json!({
+            "correlation_id": id.clone(),
+            "tool": request.tool.clone(),
+            "target": target.clone(),
+            "timeout_sec": timeout_sec,
+            "max_output_bytes": max_output_bytes
+        }),
+    );
 
     emit(
         writer,
@@ -833,6 +871,17 @@ async fn run_request<W: AsyncWrite + Unpin>(
         duration_ms: started.elapsed().as_millis(),
     };
 
+    log_observation(
+        config,
+        "stream_run_finished",
+        json!({
+            "correlation_id": id.clone(),
+            "exit_code": final_status.exit_code,
+            "timed_out": final_status.timed_out,
+            "duration_ms": final_status.duration_ms
+        }),
+    );
+
     emit(
         writer,
         Event {
@@ -852,6 +901,95 @@ async fn run_request<W: AsyncWrite + Unpin>(
 }
 
 async fn execute_request_collect(config: &BridgeConfig, request: RunRequest) -> Result<CollectedRun> {
+    let correlation_id = request.id.clone().unwrap_or_else(|| "request".to_string());
+    let max_attempts = config.max_retries.saturating_add(1);
+    let mut attempt: u32 = 1;
+
+    loop {
+        log_observation(
+            config,
+            "attempt_started",
+            json!({
+                "correlation_id": correlation_id.clone(),
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "tool": request.tool.clone(),
+                "host": request.host.clone()
+            }),
+        );
+
+        match execute_request_collect_once(config, request.clone()).await {
+            Ok(mut collected) => {
+                collected.attempts = attempt;
+                let success = run_success(&collected.final_status);
+
+                log_observation(
+                    config,
+                    "attempt_finished",
+                    json!({
+                        "correlation_id": correlation_id.clone(),
+                        "attempt": attempt,
+                        "success": success,
+                        "exit_code": collected.final_status.exit_code,
+                        "timed_out": collected.final_status.timed_out,
+                        "duration_ms": collected.final_status.duration_ms,
+                        "truncated": collected.truncated
+                    }),
+                );
+
+                if success || attempt >= max_attempts {
+                    return Ok(collected);
+                }
+
+                let backoff_ms = config.retry_backoff_ms.saturating_mul(attempt as u64);
+                log_observation(
+                    config,
+                    "retry_scheduled",
+                    json!({
+                        "correlation_id": correlation_id.clone(),
+                        "attempt": attempt,
+                        "next_attempt": attempt + 1,
+                        "backoff_ms": backoff_ms
+                    }),
+                );
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            }
+            Err(error) => {
+                let message = error.to_string();
+                log_observation(
+                    config,
+                    "attempt_error",
+                    json!({
+                        "correlation_id": correlation_id.clone(),
+                        "attempt": attempt,
+                        "message": message
+                    }),
+                );
+
+                if attempt >= max_attempts {
+                    return Err(error);
+                }
+
+                let backoff_ms = config.retry_backoff_ms.saturating_mul(attempt as u64);
+                log_observation(
+                    config,
+                    "retry_scheduled",
+                    json!({
+                        "correlation_id": correlation_id.clone(),
+                        "attempt": attempt,
+                        "next_attempt": attempt + 1,
+                        "backoff_ms": backoff_ms
+                    }),
+                );
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            }
+        }
+
+        attempt = attempt.saturating_add(1);
+    }
+}
+
+async fn execute_request_collect_once(config: &BridgeConfig, request: RunRequest) -> Result<CollectedRun> {
     let policy = config
         .tools
         .get(&request.tool)
@@ -984,7 +1122,28 @@ async fn execute_request_collect(config: &BridgeConfig, request: RunRequest) -> 
         stdout: stdout_text,
         stderr: stderr_text,
         truncated,
+        attempts: 1,
     })
+}
+
+fn run_success(status: &FinalStatus) -> bool {
+    !status.timed_out && status.exit_code.unwrap_or(1) == 0
+}
+
+fn log_observation(config: &BridgeConfig, event: &str, payload: Value) {
+    if !config.observability_json_logs {
+        return;
+    }
+    let timestamp_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or(0);
+    let line = json!({
+        "ts_ms": timestamp_ms,
+        "event": event,
+        "payload": payload
+    });
+    eprintln!("{}", line);
 }
 
 fn build_remote_command(policy: &ToolPolicy, args: &[String], timeout_sec: u64) -> String {

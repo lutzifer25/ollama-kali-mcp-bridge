@@ -19,6 +19,8 @@ Systemnahe Bridge zwischen Ollama (Agent/LLM) auf macOS und Kali-Tools auf Kali 
 - Tool-Whitelist mit Arg-Limit
 - `timeout --signal=TERM --kill-after=5s` auf Kali
 - SSH-Härtung: `ConnectTimeout`, `ServerAliveInterval`, `ServerAliveCountMax`, `StrictHostKeyChecking`
+- Retry-Policy mit Backoff für MCP/Workflow-Ausführungen
+- JSON-Observability-Logs auf `stderr` (korrelationsfähig)
 - Strukturierte Events: `started`, `stdout_chunk`, `stderr_chunk`, `output_truncated`, `finished`, `error`
 
 ## Voraussetzungen
@@ -104,6 +106,22 @@ Workflow-Request (eine Zeile JSON):
 ```
 
 Antwort-Events: `workflow_started`, `step_started`, `step_finished`, `step_failed`, `workflow_finished`.
+
+`step_finished` enthält zusätzlich `attempts`, damit die KI Retry-Verläufe auswerten kann.
+
+## Observability und Retry-Policy
+
+Zusätzliche Konfigurationsfelder in `bridge-config.json`:
+
+- `max_retries`: Anzahl Wiederholungen nach fehlgeschlagenem Attempt (Timeout/Exit != 0 oder Laufzeitfehler)
+- `retry_backoff_ms`: linearer Backoff in Millisekunden (`attempt * retry_backoff_ms`)
+- `observability_json_logs`: schreibt strukturierte Logs nach `stderr`
+
+Beispiel-Logzeile:
+
+```json
+{"ts_ms":1740770600123,"event":"retry_scheduled","payload":{"correlation_id":"mcp-call","attempt":1,"next_attempt":2,"backoff_ms":750}}
+```
 
 ## Sicherheitsprinzipien
 
