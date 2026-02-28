@@ -1,0 +1,22 @@
+{
+  "default_timeout_sec": 30,
+  "max_timeout_sec": 180,
+  "max_output_bytes": 131072,
+  "tools": {
+    "nmap": {
+      "command": "/usr/bin/nmap",
+      "default_args": [],
+      "max_args": 12
+    },
+    "nikto": {
+      "command": "/usr/bin/nikto",
+      "default_args": [],
+      "max_args": 12
+    },
+    "sqlmap": {
+      "command": "/usr/bin/sqlmap",
+      "default_args": [],
+      "max_args": 12
+    }
+  }
+}
